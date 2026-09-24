@@ -17,6 +17,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -26,6 +27,7 @@ sys.path.insert(0, str(RAIZ))
 
 from src import evaluacion, portafolio as pf  # noqa: E402
 from src.conformal import ancho_relativo  # noqa: E402
+from src.deflactar import a_pesos_constantes  # noqa: E402
 from src.explicacion import NOMBRES  # noqa: E402
 from src.generar_mercado import (ANIO_FINAL, ANIO_INICIAL, CIUDADES,  # noqa: E402
                                  USOS, generar_operaciones, generar_portafolio)
@@ -145,17 +147,31 @@ with tab_valuar:
             similares["cercania"] = (
                 np.abs(np.log(similares["superficie_m2"] / superficie))
                 + np.abs(np.log(similares["dist_centro_km"] / dist_centro)))
-            comparables = similares.nsmallest(8, "cercania")
+            comparables = similares.nsmallest(8, "cercania").copy()
+            # Las dos columnas de precio, a propósito. La estimación de arriba
+            # está en pesos de hoy; comparar contra lo que se pagó en 2019 sin
+            # reexpresarlo es justo el error que este repo existe para evitar,
+            # y sería absurdo cometerlo en su propia pantalla.
+            comparables["precio_hoy"] = a_pesos_constantes(
+                comparables, "precio_m2_nominal").to_numpy()
             st.caption(f"Los 8 comparables más parecidos de los "
                        f"{len(similares)} registrados en {ciudad}")
             st.dataframe(
                 comparables[["anio", "superficie_m2", "dist_centro_km", "cus",
-                             "esquina", "precio_m2_nominal"]]
+                             "esquina", "precio_m2_nominal", "precio_hoy"]]
                 .rename(columns={"anio": "Año", "superficie_m2": "m²",
                                  "dist_centro_km": "km al centro", "cus": "CUS",
                                  "esquina": "Esquina",
-                                 "precio_m2_nominal": "Precio/m² pagado"}),
-                hide_index=True, width="stretch")
+                                 "precio_m2_nominal": "Pagado entonces",
+                                 "precio_hoy": "En pesos de hoy"}),
+                hide_index=True, width="stretch",
+                column_config={
+                    "Pagado entonces": st.column_config.NumberColumn(format="dollar"),
+                    "En pesos de hoy": st.column_config.NumberColumn(format="dollar")})
+            st.caption(
+                "La estimación de arriba está en pesos de hoy. La última columna "
+                "reexpresa cada comparable al mismo poder adquisitivo — sin eso, "
+                "una operación de 2019 parece barata cuando solo es vieja.")
         else:
             st.info("Pocos comparables para esa combinación de ciudad y uso. "
                     "El intervalo ya lo refleja: es más ancho.")
@@ -182,12 +198,16 @@ with tab_cartera:
     k3.metric("Plusvalía real", f"{res['plusvalia_real_cartera']:+.1%}",
               help="Por encima de la inflación. No es el número que sale de "
                    "comparar pesos de 2018 con pesos de 2025.")
-    k4.metric("Predios a revisar", res["por_encima_del_rango"])
+    fuera = res["por_encima_del_rango"] + res["por_debajo_del_rango"]
+    k4.metric("Fuera de rango", fuera,
+              help=f"{res['por_encima_del_rango']} por encima del rango y "
+                   f"{res['por_debajo_del_rango']} por debajo. Los de arriba "
+                   f"ameritan revisión; los de abajo fueron buenas compras.")
 
-    if res["por_encima_del_rango"]:
+    if fuera:
         st.info(
-            f"Quitando los {res['por_encima_del_rango'] + res['por_debajo_del_rango']} "
-            f"predios que el modelo manda a revisar, la plusvalía real de la "
+            f"Quitando los {fuera} "
+            f"predios que el modelo marca fuera de rango, la plusvalía real de la "
             f"cartera sería **{res['plusvalia_sin_marcados']:+.1%}** en lugar de "
             f"**{res['plusvalia_real_cartera']:+.1%}**. Un puñado de operaciones "
             f"explica casi toda la diferencia."
@@ -267,11 +287,30 @@ with tab_modelo:
     k3.metric("Ancho mediano", f"±{mi['ancho_mediano'] / 2:.0%}")
 
     anual = evaluacion.por_anio(r, alpha=ALPHA)
+    anual["anio"] = anual["anio"].astype(str)
     izq, der = st.columns(2)
+
     izq.caption("Cobertura año por año — validación con ventana expansiva")
-    izq.bar_chart(anual.set_index("anio")["cobertura"], height=250)
+    barras = alt.Chart(anual).mark_bar(color="#4f9cf9", size=38).encode(
+        x=alt.X("anio:N", title=None),
+        y=alt.Y("cobertura:Q", title="cobertura",
+                scale=alt.Scale(domain=[0, 1]),
+                axis=alt.Axis(format="%")),
+        tooltip=["anio", alt.Tooltip("cobertura:Q", format=".1%"), "n"])
+    meta = alt.Chart(pd.DataFrame({"y": [1 - ALPHA]})).mark_rule(
+        color="#f6ad55", strokeDash=[5, 4], size=2).encode(y="y:Q")
+    izq.altair_chart(barras + meta, use_container_width=True)
+    izq.caption("La línea punteada es lo prometido: 90%.")
+
     der.caption("Error mediano año por año")
-    der.bar_chart(anual.set_index("anio")["MdAPE"], height=250)
+    der.altair_chart(
+        alt.Chart(anual).mark_bar(color="#4f9cf9", size=38).encode(
+            x=alt.X("anio:N", title=None),
+            y=alt.Y("MdAPE:Q", title="error mediano",
+                    scale=alt.Scale(domain=[0, 0.25]), axis=alt.Axis(format="%")),
+            tooltip=["anio", alt.Tooltip("MdAPE:Q", format=".1%"), "n"]),
+        use_container_width=True)
+    der.caption("Estable entre 13% y 15% en los cinco años evaluados.")
 
     anchos = ancho_relativo(r["lo"].to_numpy(), r["hi"].to_numpy())
     st.caption("El intervalo se abre donde hay menos comparables: cada punto es "
@@ -289,10 +328,32 @@ with tab_modelo:
         for col, etiqueta, titulo in [
                 (izq, "nominal", "Entrenado en pesos corrientes"),
                 (der, "deflactado", "Entrenado en pesos constantes")]:
-            sub = imp[imp["entrenamiento"] == etiqueta].head(8)
+            sub = imp[imp["entrenamiento"] == etiqueta]
+            # Las 7 primeras más el año, siempre, aunque se haya caído del
+            # top: si no aparece en los dos paneles no hay comparación que ver.
+            top = pd.concat([sub.head(7),
+                             sub[sub["columna"] == "anios_desde_inicio"]]
+                            ).drop_duplicates("columna")
+            top["es_anio"] = top["columna"] == "anios_desde_inicio"
             col.caption(titulo)
-            col.bar_chart(sub.set_index("variable")["peso_relativo"],
-                          horizontal=True, height=300)
+            col.altair_chart(
+                alt.Chart(top).mark_bar(size=20).encode(
+                    # sort="-x" es el arreglo: sin esto altair (y st.bar_chart)
+                    # ordenan alfabéticamente y el ranking, que es el mensaje
+                    # entero de esta gráfica, se pierde.
+                    y=alt.Y("variable:N", sort="-x", title=None),
+                    x=alt.X("peso_relativo:Q", title="importancia relativa",
+                            scale=alt.Scale(domain=[0, 1])),
+                    color=alt.Color("es_anio:N",
+                                    scale=alt.Scale(domain=[False, True],
+                                                    range=["#4f9cf9", "#f6ad55"]),
+                                    legend=None),
+                    tooltip=["variable",
+                             alt.Tooltip("peso_relativo:Q", format=".2f"),
+                             alt.Tooltip("lugar:Q", title="lugar")]
+                ).properties(height=260),
+                use_container_width=True)
+        st.caption("En naranja, el año de la operación.")
         fila_n = imp[(imp["entrenamiento"] == "nominal")
                      & (imp["columna"] == "anios_desde_inicio")].iloc[0]
         fila_d = imp[(imp["entrenamiento"] == "deflactado")
