@@ -15,7 +15,7 @@
 > ones I would deploy; the numbers describe this synthetic market and nothing
 > else.
 
-**▶ Live demo:** *(pending deploy — the link goes here)*
+**▶ Live demo: <https://property-valuation-model.streamlit.app>** — *first load may take ~40s while the free instance wakes up.*
 
 ---
 
